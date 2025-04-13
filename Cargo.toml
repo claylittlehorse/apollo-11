@@ -3,6 +3,9 @@ name = "apollo-11"
 version = "0.1.0"
 edition = "2024"
 
+[profile.dev.package.full_moon]
+opt-level = 3
+
 [dependencies]
 axum = { version = "0.8.3", features = ["macros"] }
 full_moon = { version = "1.2.0", features = ["luau", "serde"] }
