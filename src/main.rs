@@ -365,40 +365,56 @@ fn add_trivia_to_suffix(suffix: &Suffix, trailing: Vec<&Token>) -> Suffix {
 struct ExpressionPuller {
     pulled_prefix: Option<Prefix>,
     pulled_suffixes: Option<Vec<Suffix>>,
+    leading: Vec<Token>,
+    trailing: Vec<Token>,
 }
 impl VisitorMut for ExpressionPuller {
     fn visit_var_expression(&mut self, node: VarExpression) -> VarExpression {
-        let (leading, trailing) = node.surrounding_trivia();
-
         let mut new_suffixes: Vec<Suffix> = node.suffixes().map(|t| t.to_owned().clone()).collect();
         if let Some(last_suffix) = new_suffixes.pop() {
-            new_suffixes.push(add_trivia_to_suffix(&last_suffix, trailing))
+            new_suffixes.push(add_trivia_to_suffix(
+                &last_suffix,
+                self.trailing.iter().collect(),
+            ))
         }
 
-        // TODO Refactor type on trailing vector so that it works above and below
-
-        self.pulled_prefix = Some(add_trivia_to_prefix(leading, node.prefix()));
+        self.pulled_prefix = Some(add_trivia_to_prefix(
+            self.leading.iter().collect(),
+            node.prefix(),
+        ));
         self.pulled_suffixes = Some(new_suffixes);
         node
     }
     fn visit_function_call(&mut self, node: FunctionCall) -> FunctionCall {
-        self.pulled_prefix = Some(node.prefix().clone().to_owned());
-        self.pulled_suffixes = Some(node.suffixes().map(|t| t.clone().to_owned()).collect());
+        let mut new_suffixes: Vec<Suffix> = node.suffixes().map(|t| t.to_owned().clone()).collect();
+        if let Some(last_suffix) = new_suffixes.pop() {
+            new_suffixes.push(add_trivia_to_suffix(
+                &last_suffix,
+                self.trailing.iter().collect(),
+            ))
+        }
+
+        self.pulled_prefix = Some(add_trivia_to_prefix(
+            self.leading.iter().collect(),
+            node.prefix(),
+        ));
+        self.pulled_suffixes = Some(new_suffixes);
         node
     }
 }
 
-fn pull_expression(source: &str, is_last: bool) -> (Option<Prefix>, Option<Vec<Suffix>>) {
-    let source = if is_last {
-        format!("{}\n", source)
-    } else {
-        source.to_string()
-    };
+fn pull_expression(
+    source: &str,
+    leading: Vec<&Token>,
+    trailing: Vec<&Token>,
+) -> (Option<Prefix>, Option<Vec<Suffix>>) {
     match parse(&source) {
         Ok(ast) => {
             let mut puller = ExpressionPuller {
                 pulled_prefix: None,
                 pulled_suffixes: None,
+                leading: leading.iter().map(|t| t.to_owned().clone()).collect(),
+                trailing: trailing.iter().map(|t| t.to_owned().clone()).collect(),
             };
 
             puller.visit_ast(ast);
@@ -408,7 +424,9 @@ fn pull_expression(source: &str, is_last: bool) -> (Option<Prefix>, Option<Vec<S
     }
 }
 
-fn convert_service_access(node: &VarExpression, is_last: bool) -> Option<Expression> {
+fn convert_service_access(node: &VarExpression) -> Option<Expression> {
+    let (leading, trailing) = node.surrounding_trivia();
+
     let suffixes: Vec<&Suffix> = node.suffixes().into_iter().collect();
     if suffixes.len() < 1 {
         return None;
@@ -434,17 +452,18 @@ fn convert_service_access(node: &VarExpression, is_last: bool) -> Option<Express
         return None;
     }
 
-    let is_last = if suffixes.len() > service_index + 1 {
-        false
+    let trailing = if suffixes.len() > service_index + 1 {
+        Vec::new()
     } else {
-        is_last
+        trailing
     };
 
     let (new_prefix, mut new_suffixes) = if let Suffix::Index(index) = suffixes[service_index] {
         if let Some(identifier) = get_index_identifier(index) {
             let (opt_new_prefix, opt_new_suffixes) = pull_expression(
                 &format!("local _ = game:GetService(\"{}\")", identifier),
-                is_last,
+                leading,
+                trailing,
             );
 
             if opt_new_prefix.is_some() && opt_new_suffixes.is_some() {
@@ -465,103 +484,266 @@ fn convert_service_access(node: &VarExpression, is_last: bool) -> Option<Express
         }
     }
 
-    return Some(Expression::FunctionCall(
+    Some(Expression::FunctionCall(
         FunctionCall::new(new_prefix).with_suffixes(new_suffixes),
-    ));
+    ))
 }
 
-struct ServiceRefactor {}
-impl VisitorMut for ServiceRefactor {
-    fn visit_block(&mut self, block: ast::Block) -> ast::Block {
-        let mut stmts = Vec::new();
-        let mut any_stmts_refactored = false;
-        for (stmt, semi) in block.stmts_with_semicolon() {
-            match stmt {
-                Stmt::LocalAssignment(assignment) => {
-                    let mut expressions = Punctuated::new();
-                    let mut any_expressions_refactored = false;
+fn convert_service_access_varexp(node: &VarExpression) -> Option<VarExpression> {
+    let (leading, trailing) = node.surrounding_trivia();
 
-                    let mut pair_peekable = assignment.expressions().pairs().peekable();
-                    while let Some(pair) = pair_peekable.next() {
-                        let (expression, punctuation) = pair.clone().into_tuple();
-                        match expression {
-                            Expression::Var(ref var) => match var {
-                                Var::Expression(var_expr) => {
-                                    if let Some(new_expr) = convert_service_access(
-                                        &**var_expr,
-                                        pair_peekable.peek().is_none(),
-                                    ) {
-                                        expressions.push(Pair::new(new_expr, punctuation));
-                                        any_expressions_refactored = true;
-                                        continue;
-                                    }
-                                }
-                                _ => {}
-                            },
-                            _ => {}
-                        };
+    let suffixes: Vec<&Suffix> = node.suffixes().into_iter().collect();
+    if suffixes.len() < 1 {
+        return None;
+    }
 
-                        expressions.push(Pair::new(expression.clone(), punctuation));
-                    }
+    let service_index = if is_identifier(node.prefix(), "_G") {
+        if let Suffix::Index(index) = suffixes[0] {
+            if is_identifier_literally(index, "Services") {
+                1
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    } else if is_identifier(node.prefix(), "Services") {
+        0
+    } else {
+        return None;
+    };
 
-                    if any_expressions_refactored {
-                        any_stmts_refactored = true;
-                        stmts.push((
-                            Stmt::LocalAssignment(assignment.clone().with_expressions(expressions)),
-                            semi.clone(),
-                        ));
-                        continue;
-                    }
-                }
-                Stmt::Assignment(assignment) => {
-                    let mut expressions = Punctuated::new();
-                    let mut any_expressions_refactored = false;
+    if suffixes.len() < service_index + 1 {
+        return None;
+    }
 
-                    let mut pair_peekable = assignment.expressions().pairs().peekable();
-                    while let Some(pair) = pair_peekable.next() {
-                        let (expression, punctuation) = pair.clone().into_tuple();
-                        match expression {
-                            Expression::Var(ref var) => match var {
-                                Var::Expression(var_expr) => {
-                                    if let Some(new_expr) = convert_service_access(
-                                        &**var_expr,
-                                        pair_peekable.peek().is_none(),
-                                    ) {
-                                        expressions.push(Pair::new(new_expr, punctuation));
-                                        any_expressions_refactored = true;
-                                        continue;
-                                    }
-                                }
-                                _ => {}
-                            },
-                            _ => {}
-                        };
+    let trailing = if suffixes.len() > service_index + 1 {
+        Vec::new()
+    } else {
+        trailing
+    };
 
-                        expressions.push(Pair::new(expression.clone(), punctuation));
-                    }
+    let (new_prefix, mut new_suffixes) = if let Suffix::Index(index) = suffixes[service_index] {
+        if let Some(identifier) = get_index_identifier(index) {
+            let (opt_new_prefix, opt_new_suffixes) = pull_expression(
+                &format!("local _ = game:GetService(\"{}\")", identifier),
+                leading,
+                trailing,
+            );
 
-                    if any_expressions_refactored {
-                        any_stmts_refactored = true;
-                        stmts.push((
-                            Stmt::Assignment(Assignment::new(
-                                assignment.variables().clone(),
-                                expressions,
-                            )),
-                            semi.clone(),
-                        ));
+            if opt_new_prefix.is_some() && opt_new_suffixes.is_some() {
+                (opt_new_prefix.unwrap(), opt_new_suffixes.unwrap())
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    if suffixes.len() > service_index + 1 {
+        for suffix in &suffixes[service_index + 1..] {
+            new_suffixes.push(suffix.to_owned().clone())
+        }
+    }
+
+    Some(VarExpression::new(new_prefix).with_suffixes(new_suffixes))
+}
+
+fn convert_service_access_fn(node: &FunctionCall) -> Option<FunctionCall> {
+    let (leading, trailing) = node.surrounding_trivia();
+
+    let suffixes: Vec<&Suffix> = node.suffixes().into_iter().collect();
+    if suffixes.len() < 1 {
+        return None;
+    }
+
+    let service_index = if is_identifier(node.prefix(), "_G") {
+        if let Suffix::Index(index) = suffixes[0] {
+            if is_identifier_literally(index, "Services") {
+                1
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    } else if is_identifier(node.prefix(), "Services") {
+        0
+    } else {
+        return None;
+    };
+
+    if suffixes.len() < service_index + 1 {
+        return None;
+    }
+
+    let trailing = if suffixes.len() > service_index + 1 {
+        Vec::new()
+    } else {
+        trailing
+    };
+
+    let (new_prefix, mut new_suffixes) = if let Suffix::Index(index) = suffixes[service_index] {
+        if let Some(identifier) = get_index_identifier(index) {
+            let (opt_new_prefix, opt_new_suffixes) = pull_expression(
+                &format!("local _ = game:GetService(\"{}\")", identifier),
+                leading,
+                trailing,
+            );
+
+            if opt_new_prefix.is_some() && opt_new_suffixes.is_some() {
+                (opt_new_prefix.unwrap(), opt_new_suffixes.unwrap())
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    if suffixes.len() > service_index + 1 {
+        for suffix in &suffixes[service_index + 1..] {
+            new_suffixes.push(suffix.to_owned().clone())
+        }
+    }
+
+    Some(FunctionCall::new(new_prefix).with_suffixes(new_suffixes))
+}
+
+fn refactor_expressions(
+    pairs_iter: &mut dyn Iterator<Item = &Pair<Expression>>,
+) -> Option<Punctuated<Expression>> {
+    let mut expressions = Punctuated::new();
+
+    let mut any_expressions_refactored = false;
+    for pair in pairs_iter {
+        let (expression, punctuation) = pair.clone().into_tuple();
+        match expression {
+            Expression::Var(ref var) => match var {
+                Var::Expression(var_expr) => {
+                    if let Some(new_expr) = convert_service_access(var_expr) {
+                        expressions.push(Pair::new(new_expr, punctuation));
+                        any_expressions_refactored = true;
                         continue;
                     }
                 }
                 _ => {}
-            };
+            },
+            Expression::FunctionCall(ref function_call) => {
+                if let Some(function_call) = convert_service_access_fn(function_call) {
+                    expressions.push(Pair::new(
+                        Expression::FunctionCall(function_call),
+                        punctuation,
+                    ));
+                    any_expressions_refactored = true;
+                    continue;
+                }
+            }
+            _ => {}
+        };
 
-            stmts.push((stmt.clone(), semi.clone()));
-        }
+        expressions.push(Pair::new(expression.clone(), punctuation));
+    }
 
-        if any_stmts_refactored {
-            return block.with_stmts(stmts);
+    if any_expressions_refactored {
+        return Some(expressions);
+    }
+
+    None
+}
+
+fn refactor_vars(pairs_iter: &mut dyn Iterator<Item = &Pair<Var>>) -> Option<Punctuated<Var>> {
+    let mut vars = Punctuated::new();
+
+    let mut any_vars_refactored = false;
+    for pair in pairs_iter {
+        let (ref var, punctuation) = pair.clone().into_tuple();
+        match var {
+            Var::Name(_) => {}
+            Var::Expression(var_expr) => {
+                if let Some(new_expr) = convert_service_access_varexp(&var_expr) {
+                    vars.push(Pair::new(Var::Expression(Box::new(new_expr)), punctuation));
+                    any_vars_refactored = true;
+                    continue;
+                }
+            }
+            _ => {}
+        };
+
+        vars.push(Pair::new(var.clone(), punctuation));
+    }
+
+    if any_vars_refactored {
+        return Some(vars);
+    }
+
+    None
+}
+
+struct ServiceRefactor {}
+impl VisitorMut for ServiceRefactor {
+    fn visit_stmt(&mut self, stmt: Stmt) -> Stmt {
+        match stmt {
+            Stmt::LocalAssignment(ref assignment) => {
+                let expressions = refactor_expressions(&mut assignment.expressions().pairs());
+
+                if let Some(expressions) = expressions {
+                    Stmt::LocalAssignment(assignment.clone().with_expressions(expressions))
+                } else {
+                    stmt.clone()
+                }
+            }
+            Stmt::Assignment(ref assignment) => {
+                let expressions = refactor_expressions(&mut assignment.expressions().pairs());
+
+                if let Some(expressions) = expressions {
+                    Stmt::Assignment(Assignment::new(assignment.variables().clone(), expressions))
+                } else {
+                    stmt.clone()
+                }
+            }
+            Stmt::FunctionCall(ref function_call) => {
+                if let Some(function_call) = convert_service_access_fn(function_call) {
+                    Stmt::FunctionCall(function_call)
+                } else {
+                    stmt.clone()
+                }
+            }
+            _ => stmt,
         }
-        block
+    }
+    fn visit_function_call(&mut self, function_call: FunctionCall) -> FunctionCall {
+        if let Some(function_call) = convert_service_access_fn(&function_call) {
+            function_call
+        } else {
+            function_call
+        }
+    }
+    fn visit_assignment(&mut self, assignment: Assignment) -> Assignment {
+        let vars = refactor_vars(&mut assignment.variables().pairs());
+
+        if let Some(vars) = vars {
+            assignment.clone().with_variables(vars)
+        } else {
+            assignment
+        }
+    }
+    fn visit_var(&mut self, var: Var) -> Var {
+        match var {
+            Var::Name(_) => var,
+            Var::Expression(ref var_expr) => {
+                if let Some(new_expr) = convert_service_access_varexp(&var_expr) {
+                    return Var::Expression(Box::new(new_expr));
+                };
+                var
+            }
+            _ => var,
+        }
     }
 }
 
